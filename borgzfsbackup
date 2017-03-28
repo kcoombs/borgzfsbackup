@@ -1,13 +1,8 @@
 #!/usr/local/bin/bash
 
-# v0.3
-
 # Space separated list of pools for backup.
 #POOLS="zroot zdata test"
 POOLS="zroot zdata"
-
-# TODO: volumes to ignore
-#IGNORE=""
 
 # Base name used for ZFS snapshots (snapshot will be @SNAPBASENAME-YYYY-DD-MM)
 SNAPBASENAME="backup"
@@ -63,10 +58,8 @@ TIME=$(date "+%H-%M")
 # Enable verbose messages (yes/no)
 DEBUG="no"
 
-# TODO: Log directory
+# Directory for log files
 LOGDIR="/home/haladmin/backuplogs"
-
-## TODO: Capture errors and report in failure statements
 
 # Temporary file to capture errors
 ERRORTMP=/tmp/backup-borg
