@@ -1,0 +1,10 @@
+List of TODO items (in no particlar order)
+
+- Break off config options into config file
+  - Sanity check values
+- MAN page
+- Better logging
+- Add support for local repositories
+- Command-line options and brief help
+- FreeBSD PORT
+- Ability to exclude filesystems
