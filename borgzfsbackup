@@ -1,0 +1,322 @@
+#!/usr/local/bin/bash
+
+# v0.3
+
+# Space separated list of pools for backup.
+#POOLS="zroot zdata test"
+POOLS="zroot zdata"
+
+# TODO: volumes to ignore
+#IGNORE=""
+
+# Base name used for ZFS snapshots (snapshot will be @SNAPBASENAME-YYYY-DD-MM)
+SNAPBASENAME="backup"
+
+# Base path on remote server for repositories; no spaces and no trailing slash.
+REPOBASE="/Volumes/serverbackups"
+
+# Hostname for the remote host.
+RHOST="macminiserver"
+
+# User at the remote host.
+RUSER="admin"
+
+# Script should be executed as this user.
+SUSER="root"
+
+# Borg compression (and level): 
+#	none == no compression (default), 
+#	lz4 == lz4, 
+#   zlib == zlib (default level 6), zlib,0 .. zlib,9 == zlib (with level 0..9), 
+#   lzma == lzma (default level 6), lzma,0 .. lzma,9 == lzma (with level 0..9).
+COMPRESS="zlib"
+
+# Full path to the 'borg' binary
+BORG="/usr/local/bin/borg"
+
+# Borg prune flags. If empty ("") prune will not be performed
+# 
+# Available options:
+#  --keep-within WITHIN  keep all archives within this time interval
+#  -H HOURLY, --keep-hourly HOURLY (number of hourly archives to keep)
+#  -d DAILY, --keep-daily DAILY (number of daily archives to keep)
+#  -w WEEKLY, --keep-weekly WEEKLY (number of weekly archives to keep)
+#  -m MONTHLY, --keep-monthly MONTHLY (number of monthly archives to keep)
+#  -y YEARLY, --keep-yearly YEARLY (number of yearly archives to keep)
+#
+# Examples:
+#  * Keep 7 end of day and 4 additional end of week archives:
+#    PRUNE_FLAGS="--keep-daily=7 --keep-weekly=4"
+#  * Keep 7 end of day, 4 additional end of week archives, and an end of month 
+#    archive for every month:
+#    PRUNE_FLAGS="-keep-daily=7 --keep-weekly=4 --keep-monthly=1"
+#  * Keep all backups in the last 10 days, 4 additional end of week archives,
+#    and an end of month archive for every month:
+#    PRUNE _FLAGS="--keep-within=10d --keep-weekly=4 --keep-monthly=1"
+PRUNE_FLAGS="--keep-within=1d --keep-weekly=4 --keep-monthly=-1"
+#PRUNE_FLAGS=""
+
+# Some Date/Time Variables
+DATE=$(date "+%Y-%m-%d")
+TIME=$(date "+%H-%M")
+
+# Enable verbose messages (yes/no)
+DEBUG="no"
+
+# TODO: Log directory
+LOGDIR="/home/haladmin/backuplogs"
+
+## TODO: Capture errors and report in failure statements
+
+# Temporary file to capture errors
+ERRORTMP=/tmp/backup-borg
+
+#
+# Function: Create a recursive ZFS snapshot on each dataset in $1 using 
+# snapshot name $2
+#
+zfs_snapshot() {
+  local POOL=$1
+  local SNAPNAME=$2
+  if [ $POOL == "" ]; then
+    echo -e "	Error: Pool name was empy."
+    return 1
+  fi
+  if [ $SNAPNAME == "" ]; then
+    echo -e "	Error: Snapshot name was empy."
+    return 1
+  fi
+  echo -e "  * Creating recursive snapshot: '${POOL}@${SNAPNAME}'..."
+  zfs snap -r "${POOL}@${SNAPNAME}"
+  if [ $? -ne 0 ]; then
+    if [ ${DEBUG} = "yes" ]; then echo -e "    - Snapshot failure."; fi
+    return 1
+  else
+   if [ ${DEBUG} = "yes" ]; then echo -e "    - Snapshot success!"; fi
+  fi
+  return 0
+}
+
+#
+# Function: Recursively destroy a ZFS Snapshot in $1 using snapshot name $2
+#
+zfs_destroy() {
+  local POOL=$1
+  local SNAPNAME=$2
+  if [ $POOL == "" ]; then
+    echo -e "	Error: Pool name was empy."
+    return 1
+  fi
+  if [ $SNAPNAME == "" ]; then
+    echo -e "	Error: Snapshot name was empy."
+    return 1
+  fi
+  echo -e "  * Recursively destroying snapshot: '${POOL}@${SNAPNAME}'..."
+  zfs destroy -r "${POOL}@${SNAPNAME}"
+  if [ $? -ne 0 ]; then
+    if [ ${DEBUG} = "yes" ]; then echo -e "    - Destroy failure."; fi
+    return 1
+  else
+    if [ ${DEBUG} = "yes" ]; then echo -e "    - Destroy success!"; fi
+  fi
+  return 0
+}
+
+#
+# Function: Populate the $FILESYSTEMS global with a whitespace-delimited list of
+# ZFS filesystems in $1 that have mountpoints
+#
+get_filesystems() {
+  local LPOOL=$1
+  
+  # Get a recursive list of filesystems and their mount points under $LPOOL. 
+  # The output should have three tab-separated columns per line: 
+  # the filesystem name, its mount point, and whether it's mounted (yes/no)
+  local ZFS_LIST=$(zfs list -Hro name,mountpoint,mounted ${LPOOL} 2> ${ERRORTMP})
+    
+  # Were any filesystems returned?
+  if [ "${ZFS_LIST}" = "" ]; then
+    echo -e "	Output of 'zfs list ${LPOOL}' was empty. Message: $(cat ${ERRORTMP})"
+    return 1
+  fi
+
+  # Now, populate $FILESYSTEMS, while ignoring those that are not mounted.
+  # Format: space separated list of name:mountpoint pairs
+  while read LINE
+  do
+    if [ "$(echo ${LINE} | cut -wf 3)" = "yes" ];then
+      local FS=$(echo ${LINE} | cut -wf 1)
+      local MP=$(echo ${LINE} | cut -wf 2)
+      FILESYSTEMS="$FILESYSTEMS ${FS}:${MP}"
+    fi
+  done <<< ${ZFS_LIST}
+   
+  return 0
+}
+
+#
+# Function: Make sure the user executing the script equals $1
+#
+check_user() {
+  local USR=$1
+  local WHO=$(whoami)
+  if [ ${USR} != ${WHO} ]; then
+    echo -e "Invalid user. Expected '${USR}', found '${WHO}'."
+    return 1
+  fi
+  return 0
+}
+
+#
+# Main logic
+#
+
+# Verify the script is executing under the correct user
+if [ ${DEBUG} = "yes" ]; then echo -e "> calling check_user()"; fi
+check_user ${SUSER}
+if [ $? -ne 0 ]; then
+  if [ ${DEBUG} = "yes" ]; then echo -e ">> check_user() failure."; fi
+  exit 1
+else
+  if [ ${DEBUG} = "yes" ]; then echo -e ">> check_user() success!"; fi
+fi
+
+echo -e "Backup requested for pools: '${POOLS}'"
+
+# Iterate over the pools in $POOLS, initiating a backup of each filesystem in
+# the pool that has a mountpoint
+for POOL in ${POOLS}
+do
+  FILESYSTEMS=""
+
+  echo -e "Performing backup of filesystems in pool '${POOL}'..."
+  
+  # Populate the $FILESYSTEMS local with filesystems in the pool that have 
+  # mountpoints (space-delimited list of name:mountpoint pairs)
+  if [ ${DEBUG} = "yes" ]; then echo -e "> calling get_filesystems()"; fi
+  get_filesystems $POOL
+  if [ $? -ne 0 ]; then
+    if [ ${DEBUG} = "yes" ]; then echo -e ">> get_filesystems() failure."; fi
+    exit 1
+  else
+   if [ ${DEBUG} = "yes" ]; then echo -e ">> get_filesystems() success."; fi
+  fi
+
+  # Take a recursive ZFS snapshot of the $POOL using $SNAPBASENAME-$DATE
+  if [ ${DEBUG} = "yes" ]; then echo -e "> calling zfs_snapshot()"; fi
+  zfs_snapshot $POOL "${SNAPBASENAME}-${DATE}"
+  if [ $? -ne 0 ]; then
+     if [ ${DEBUG} = "yes" ]; then echo -e ">> zfs_snapshot() failure."; fi
+   exit 1
+  else
+    if [ ${DEBUG} = "yes" ]; then echo -e ">> zfs_snapshot() success."; fi
+  fi
+
+  # Iterate over $FILESYSTEMS to find available ZFS snapshots, and initiate
+  # backups
+  for LINE in ${FILESYSTEMS}
+  do
+    FSYS_NAME=$(echo ${LINE} | cut -d : -f 1)
+    FSYS_MP=$(echo ${LINE} | cut -d : -f 2)
+    REPOSITORY=""
+    LOGFILE=""
+    
+    echo -e "  * Backing up filesystem '${FSYS_NAME}' (mountpoint '${FSYS_MP}')..."
+    
+    # Set up the REPOSITORY name. Special case for '/'
+    if [ ${FSYS_MP} == '/' ]; then
+      REPOSITORY="${REPOBASE}/root"
+	  LOGFILE="$LOGDIR/root.log"
+	  FSYS_MP=""
+    else
+      REPOSITORY="${REPOBASE}/$(echo ${FSYS_MP} | cut -c 2- | sed 's/\//-/g')"
+      LOGFILE="${LOGDIR}/$(echo ${FSYS_MP} | cut -c 2- | sed 's/\//-/g').log"
+    fi
+
+    # Initialize the repository (will fail if repository exists).
+	echo -e "    > Initializing repository '${REPOSITORY}'..."
+	INIT_CMD="${BORG} init --encryption=none ${RUSER}@${RHOST}:${REPOSITORY}"
+	echo -e "      Command: ${INIT_CMD}"
+	eval "${INIT_CMD} 2> ${ERRORTMP}"
+	if [ $? -ne 0 ]; then
+    	echo -e "      - Initialization failure: $(cat ${ERRORTMP})"
+  	else
+    	if [ ${DEBUG} = "yes" ]; then echo -e "      - Initialization success!"; fi
+  	fi
+
+  	# Perform the backup.
+	echo -e "    > Creating archive '${REPOSITORY}::${DATE}@${TIME}' from '${FSYS_MP}/.zfs/snapshot/${SNAPBASENAME}-${DATE}' with 'compression=${COMPRESS}'..."
+	CREATE_CMD="${BORG} create -v --info -C ${COMPRESS} ${RUSER}@${RHOST}:${REPOSITORY}::${DATE}@${TIME} ${FSYS_MP}/.zfs/snapshot/${SNAPBASENAME}-${DATE}"
+	echo -e "      Command: ${CREATE_CMD}" 
+	eval "${CREATE_CMD} > ${ERRORTMP} 2>&1"
+	if [ $? -ne 0 ]; then
+    	echo -e "      - Archive creation failure. Output:"
+  	else
+    	echo -e "      - Archive creation success. Output:"
+  	fi
+	while read LINE 
+	do
+	  	echo -e "        ${LINE}"
+	done < ${ERRORTMP}
+
+	# Prune the repository.
+	if [ ! -z "${PRUNE_FLAGS}" ]; then
+	  echo -e "    > Pruning repository '${REPOSITORY}'"
+	  PRUNE_CMD="${BORG} prune -v --list ${PRUNE_FLAGS} ${RUSER}@${RHOST}:${REPOSITORY}"
+	  echo -e "      Command: ${PRUNE_CMD}" 
+	  eval "${PRUNE_CMD} > ${ERRORTMP} 2>&1" 
+	  if [ $? -ne 0 ]; then
+    	  if [ ${DEBUG} = "yes" ]; then echo -e "      - Prune failure."; fi
+  	  else
+    	  if [ ${DEBUG} = "yes" ]; then echo -e "      - Prune success!"; fi
+  	  fi
+  	  while read LINE 
+	  do
+	  	echo -e "        ${LINE}"
+	  done < ${ERRORTMP}
+  	else
+  	  echo -e "    > Pruning skipped..."  
+	fi
+	
+	# Print information about the archive.
+	echo -e "    > Printing stats for archive '${REPOSITORY}::${DATE}@${TIME}' to '${LOGFILE}'..."
+	PRINF_CMD="${BORG} info ${RUSER}@${RHOST}:${REPOSITORY}::${DATE}@${TIME}"
+	echo -e "      Command: ${PRINF_CMD}" 
+	echo -e "\n\n#\n########## [ Stats for archive '${REPOSITORY}::${DATE}@${TIME}' ] ##########\n#" >> ${LOGFILE} 2>&1
+	eval ${PRINF_CMD} >> ${LOGFILE} 2>&1
+	if [ $? -ne 0 ]; then
+    	if [ ${DEBUG} = "yes" ]; then echo -e "      - Info failure."; fi
+    else
+    	if [ ${DEBUG} = "yes" ]; then echo -e "      - Info success!"; fi
+	fi
+
+ 	# Print listing of archives in repository.
+ 	echo -e "    > Printing listing of archives in '${REPOSITORY}' to '${LOGFILE}'..."
+ 	PRLIST_CMD="${BORG} list ${RUSER}@${RHOST}:${REPOSITORY}"
+ 	echo -e "      Command: ${PRLIST_CMD}" 
+ 	echo -e "\n########## [ Archives in '${REPOSITORY}' ] ##########" >> ${LOGFILE} 2>&1
+ 	eval ${PRLIST_CMD} >> ${LOGFILE} 2>&1
+ 	if [ $? -ne 0 ]; then
+     	if [ ${DEBUG} = "yes" ]; then echo -e "      - List failure."; fi
+   else
+     	if [ ${DEBUG} = "yes" ]; then echo -e "      - List success!"; fi
+   fi
+
+  done
+
+  # Recursively destroy ZFS snapshots of the $pool using $SNAPBASENAME-$DATE
+  if [ ${DEBUG} = "yes" ]; then echo -e "> calling zfs_destroy()"; fi
+  zfs_destroy $POOL "$SNAPBASENAME-$DATE"
+  if [ $? -ne 0 ]; then
+    if [ ${DEBUG} = "yes" ]; then echo -e ">> zfs_destroy() failure."; fi
+    exit 1
+  else
+    if [ ${DEBUG} = "yes" ]; then echo -e ">> zfs_destroy() success."; fi
+  fi
+done
+
+rm ${ERRORTMP} > /dev/null 2>&1
+
+echo -e "Done."
+
+exit 0
