@@ -1,4 +1,3 @@
 # borgzfsbackup
-Automated backups using ZFS snapshots and the Borg deduplicating archiver
+A shell script for automated backups using ZFS snapshots and the Borg deduplicating archiver
 
-# Known Issues
