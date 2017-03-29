@@ -12,3 +12,4 @@ List of TODO items (in no particlar order)
 - Capture / report program output
 - Interactive / Script modes
 - Different verbosity levels
+- Cleanup snapshots if there is a failure
