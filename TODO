@@ -1,5 +1,6 @@
 List of TODO items (in no particlar order)
 
+- Handle spaces in filenames
 - Break off config options into config file
   - Sanity check values
 - MAN page
