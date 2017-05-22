@@ -1,7 +1,5 @@
 #!/usr/local/bin/bash
 
-
-
 # Space separated list of pools for backup.
 #POOLS="zroot zdata test"
 POOLS="zroot zdata"
