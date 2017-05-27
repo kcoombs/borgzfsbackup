@@ -62,7 +62,13 @@ DEBUG="no"
 LOGDIR="/home/haladmin/backuplogs"
 
 # Temporary file to capture errors
-ERRORTMP=/tmp/backup-borg
+ERRORTMP="/tmp/borgzfsbackup-errortmp"
+
+# Temporary file for composing e-mails
+MAILTMP="/tmp/borgzfsbackup-mailtmp"
+
+# Email for error logs. Emails will be sent if this variable is defined.
+EMAIL="kirk_c@coombscloud.com"
 
 #
 # Function: Create a recursive ZFS snapshot on each dataset in $1 using 
@@ -121,7 +127,7 @@ zfs_destroy() {
 #
 get_filesystems() {
 	local LPOOL=$1
-  
+
 	# Get a recursive list of filesystems and their mount points under $LPOOL. 
 	# The output should have three tab-separated columns per line: 
 	# the filesystem name, its mount point, and whether it's mounted (yes/no)
@@ -161,14 +167,53 @@ check_user() {
 }
 
 #
+# Function: Perform cleanup on errors
+#
+cleanup() {
+
+}
+
+#
+# Function: Send e-mail on errors
+#
+error_email() {
+	local METHOD=$1
+
+###Remember to define mail binary
+
+	# Check whether $EMAIL is set. E-mails only need to be sent when it is set.
+	if [ ${EMAIL} ]; then
+		if [ ${METHOD} = "check_user" ]; then
+			eval "cat \"Error in check_user.\" | mail -s \"Fatal Error\(s\) occurred running borgzfsbackup.\" ${EMAIL}"
+		elif [ ${METHOD} = "get_filesystems" ]; then
+			eval "cat \"Error in get_filesystems.\" | mail -s \"Fatal Error\(s\) occurred running borgzfsbackup.\" ${EMAIL}"
+		elif [ ${METHOD} = "zfs_snapshot" ]; then
+			eval "cat \"Error in zfs_snapshot.\" | mail -s \"Fatal Error\(s\) occurred running borgzfsbackup.\" ${EMAIL}"
+		elif [ ${METHOD} = "zfs_destroy" ]; then
+			eval "cat \"Error in zfs_destroy.\" | mail -s \"Fatal Error\(s\) occurred running borgzfsbackup.\" ${EMAIL}"
+		elif [ ${METHOD} = "non-fatal" ]; then
+			eval "echo ${MAILTMP} | mail -s \"Non-Fatal Error\(s\) occurred running borgzfsbackup.\" ${EMAIL}"
+		else 
+			echo "An unspecified error occurred. This line should not be reached."
+			return 1
+		fi
+	fi
+
+	return 0
+}
+
+#
 # Main logic
 #
+
+NONFATAL="No"
 
 # Verify the script is executing under the correct user
 if [ ${DEBUG} = "yes" ]; then echo -e "> calling check_user()"; fi
 check_user ${SUSER}
 if [ $? -ne 0 ]; then
 	if [ ${DEBUG} = "yes" ]; then echo -e ">> check_user() failure."; fi
+	error_email "check_user"
 	exit 1
 else
 	if [ ${DEBUG} = "yes" ]; then echo -e ">> check_user() success!"; fi
@@ -183,13 +228,14 @@ do
 	FILESYSTEMS=""
 
 	echo -e "Performing backup of filesystems in pool '${POOL}'..."
-  
+
 	# Populate the $FILESYSTEMS local with filesystems in the pool that have 
 	# mountpoints (space-delimited list of name:mountpoint pairs)
 	if [ ${DEBUG} = "yes" ]; then echo -e "> calling get_filesystems()"; fi
 	get_filesystems $POOL
 	if [ $? -ne 0 ]; then
 		if [ ${DEBUG} = "yes" ]; then echo -e ">> get_filesystems() failure."; fi
+		error_email "get_filesystems"
 		exit 1
 	else
 		if [ ${DEBUG} = "yes" ]; then echo -e ">> get_filesystems() success."; fi
@@ -200,6 +246,7 @@ do
 		zfs_snapshot $POOL "${SNAPBASENAME}-${DATE}"
 	if [ $? -ne 0 ]; then
 		if [ ${DEBUG} = "yes" ]; then echo -e ">> zfs_snapshot() failure."; fi
+		error_email "zfs_snapshot"
 		exit 1
 	else
 		if [ ${DEBUG} = "yes" ]; then echo -e ">> zfs_snapshot() success."; fi
@@ -213,9 +260,9 @@ do
 		FSYS_MP=$(echo ${LINE} | cut -d : -f 2)
 		REPOSITORY=""
 		LOGFILE=""
-    
+
 		echo -e "  * Backing up filesystem '${FSYS_NAME}' (mountpoint '${FSYS_MP}')..."
-    
+
 		# Set up the REPOSITORY name. Special case for '/'
 		if [ ${FSYS_MP} == '/' ]; then
 			REPOSITORY="${REPOBASE}/root"
@@ -233,6 +280,9 @@ do
 		eval "${INIT_CMD} 2> ${ERRORTMP}"
 		if [ $? -ne 0 ]; then
 			echo -e "      - Initialization failure: $(cat ${ERRORTMP})"
+			#echo -e "Error initializing repository '${REPOSITORY} "
+			#eval "cat ${ERRORTMP} >> ${MAILTMP}"
+			#$NONFATAL="Yes"
 		else
 			if [ ${DEBUG} = "yes" ]; then echo -e "      - Initialization success!"; fi
 		fi
@@ -244,6 +294,9 @@ do
 		eval "${CREATE_CMD} > ${ERRORTMP} 2>&1"
 		if [ $? -ne 0 ]; then
 			echo -e "      - Archive creation failure. Output:"
+			echo -e "Error creating archive '${REPOSITORY}::${DATE}@${TIME}' from '${FSYS_MP}/.zfs/snapshot/${SNAPBASENAME}-${DATE}'" >> ${MAILTMP}
+			eval "cat ${ERRORTMP} >> ${MAILTMP}"
+			$NONFATAL="Yes"
 		else
 			echo -e "      - Archive creation success. Output:"
 		fi
@@ -260,6 +313,9 @@ do
 			eval "${PRUNE_CMD} > ${ERRORTMP} 2>&1" 
 			if [ $? -ne 0 ]; then
 				if [ ${DEBUG} = "yes" ]; then echo -e "      - Prune failure."; fi
+				echo -e "Error pruning repostory '${REPOSITORY}'" >> ${MAILTMP}
+				eval "cat ${ERRORTMP} >> ${MAILTMP}"
+				$NONFATAL="Yes"
 			else
 				if [ ${DEBUG} = "yes" ]; then echo -e "      - Prune success!"; fi
 			fi
@@ -270,7 +326,7 @@ do
 		else
 			echo -e "    > Pruning skipped..."  
 		fi
-	
+
 		# Print information about the archive.
 		echo -e "    > Printing stats for archive '${REPOSITORY}::${DATE}@${TIME}' to '${LOGFILE}'..."
 		PRINF_CMD="${BORG} info ${RUSER}@${RHOST}:${REPOSITORY}::${DATE}@${TIME}"
@@ -279,6 +335,9 @@ do
 		eval ${PRINF_CMD} >> ${LOGFILE} 2>&1
 		if [ $? -ne 0 ]; then
 			if [ ${DEBUG} = "yes" ]; then echo -e "      - Info failure."; fi
+			echo -e "Error printing stats for archive '${REPOSITORY}::${DATE}@${TIME}'" >> ${MAILTMP}
+			eval "cat ${ERRORTMP} >> ${MAILTMP}"
+			$NONFATAL="Yes"
 		else
 			if [ ${DEBUG} = "yes" ]; then echo -e "      - Info success!"; fi
 		fi
@@ -291,6 +350,9 @@ do
 		eval ${PRLIST_CMD} >> ${LOGFILE} 2>&1
 		if [ $? -ne 0 ]; then
 			if [ ${DEBUG} = "yes" ]; then echo -e "      - List failure."; fi
+			echo -e "Error listing of archives in '${REPOSITORY}'" >> ${MAILTMP}
+			eval "cat ${ERRORTMP} >> ${MAILTMP}"
+			$NONFATAL="Yes"
 		else
 			if [ ${DEBUG} = "yes" ]; then echo -e "      - List success!"; fi
 		fi
@@ -302,6 +364,7 @@ do
 	zfs_destroy $POOL "$SNAPBASENAME-$DATE"
 	if [ $? -ne 0 ]; then
 		if [ ${DEBUG} = "yes" ]; then echo -e ">> zfs_destroy() failure."; fi
+		error_email "zfs_destroy"
 		exit 1
 	else
 		if [ ${DEBUG} = "yes" ]; then echo -e ">> zfs_destroy() success."; fi
@@ -311,5 +374,12 @@ done
 rm ${ERRORTMP} > /dev/null 2>&1
 
 echo -e "Done."
+
+# Check whether any non-fatal errors occurred during the backup process. If so,
+# report via e-mail.
+if [ ${NONFATAL} = "Yes"]; then
+	error_email "non-fatal"
+	exit 1;
+fi
 
 exit 0
